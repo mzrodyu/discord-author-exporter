@@ -52,7 +52,7 @@ GET /api/v9/guilds/{guildId}/messages/search?author_id={userId}
    - **By username**: first open that user's profile card or view one of their messages on the page so the extension can capture their info, then type the username.
    - **By user ID**: enable Developer Mode in Discord settings, right-click the user's avatar → "Copy User ID", and paste it in — the most reliable option.
    - Or: search `from: someone` once in **Discord's own search bar** first, then click "Use the user from Discord's last search" in the panel to reuse that exact, already-validated search request.
-4. Choose the search scope (whole server / current channel only) and export format. Optionally check "text-only messages" to filter out attachment-only messages.
+4. Pick the **server** and **channel** in the panel (it defaults to the server/channel you're currently viewing; leave the channel empty to target the whole server), then choose the search scope (whole server / selected channel only) and export format. Optionally check "text-only messages" to filter out attachment-only messages.
 5. Click "Start Export" and wait. The file downloads automatically when done. You can cancel at any time.
 
 If your connection drops or the page closes mid-export, progress isn't lost — clicking "Start Export" again with the same user/scope will automatically resume from the last checkpoint.
@@ -66,10 +66,13 @@ If your connection drops or the page closes mid-export, progress isn't lost — 
 | TXT  | Plain text, easy to read |
 | HTML | Discord-styled webpage for browsing |
 
+Formats are **multi-select** (e.g. check both JSON and HTML). One "Start Export" run produces one file per selected format and downloads them in sequence. The first time Chrome may ask whether to allow multiple downloads — click Allow.
+
 ## Notes & limitations
 
 - You can only export content from channels **you have permission to view**; the API won't return anything you can't already see.
 - Username lookup depends on data the extension has already captured; if it fails, use the user ID or reuse Discord's native search instead.
+- "Current channel" scope filters the guild search by `channel_id`. If that request is rejected with 403 (NSFW/age-restricted channel, threads, or a broken search index), the extension automatically falls back to paging the **channel history** and filtering by author — slower, but reliable, and checkpoint/resume still works.
 - Fetch speed is bound by Discord's own rate limits; large histories will take time.
 
 ## Project structure

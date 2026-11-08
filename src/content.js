@@ -11,6 +11,9 @@
   let cancelRequested = false;
   const userCache = new Map(); // id -> {id, username, globalName}
   let lastSearchedAuthor = null; // {authorId, guildId, label?}
+  let guildsCache = null;               // [{id, name, icon}]
+  const channelsCache = new Map();      // guildId -> [{id, name, type, parent_id, position, nsfw}]
+  let onTokenReady = null;              // 令牌晚到时用来触发面板重新加载列表
 
   // 接收主世界传来的 token
   window.addEventListener("message", function (ev) {
@@ -18,6 +21,9 @@
     if (ev.data.source === "DME_TOKEN" && ev.data.token) {
       TOKEN = ev.data.token;
       chrome.storage.local.set({ dme_has_token: true });
+      if (typeof onTokenReady === "function") {
+        try { onTokenReady(); } catch (e) { /* ignore */ }
+      }
     }
     if (ev.data.source === "DME_USERS" && Array.isArray(ev.data.users)) {
       for (const u of ev.data.users) {
@@ -141,7 +147,9 @@
         indexWaits++;
         sendProgress({ stage: "indexing", waitMs: Math.ceil(retry * 1000), attempt: indexWaits });
         if (indexWaits > 30) {
-          throw new Error("服务器搜索索引长时间未就绪，请稍后再试。");
+          const err = new Error("服务器搜索索引长时间未就绪，请稍后再试。");
+          err.code = "INDEX_TIMEOUT";
+          throw err;
         }
         await sleep(Math.ceil(retry * 1000) + 300);
         continue;
@@ -159,7 +167,15 @@
       }
 
       if (resp.status === 401 || resp.status === 403) {
-        throw new Error("无权限或 token 失效（401/403）。请确认你已登录并对该服务器有访问权限。");
+        let detail = "";
+        try {
+          const body = await resp.json();
+          if (body && body.message) detail = "：" + body.message;
+        } catch (e) { /* ignore */ }
+        const err = new Error("无权限或 token 失效（HTTP " + resp.status + "）" + detail +
+          "。请确认你已登录并对该服务器/频道有访问权限。");
+        err.status = resp.status;
+        throw err;
       }
 
       if (!resp.ok) {
@@ -168,7 +184,9 @@
           const body = await resp.json();
           if (body && body.message) detail = "：" + body.message;
         } catch (e) { /* ignore */ }
-        throw new Error("请求失败，HTTP " + resp.status + detail);
+        const err = new Error("请求失败，HTTP " + resp.status + detail);
+        err.status = resp.status;
+        throw err;
       }
 
       return resp.json();
@@ -303,6 +321,7 @@
       makeUrl = (mId) => {
         const u = new URL(tpl.href);
         u.searchParams.set("offset", "0");
+        u.searchParams.set("include_nsfw", "true");
         if (mId) u.searchParams.set("max_id", mId);
         else u.searchParams.delete("max_id");
         return u.href;
@@ -315,6 +334,8 @@
         params.set("offset", "0");
         params.set("sort_by", "timestamp");
         params.set("sort_order", "desc");
+        // 关键：频道级搜索若频道是 NSFW/年龄限制，缺 include_nsfw 会被服务端直接 403
+        params.set("include_nsfw", "true");
         if (scope.type === "channel") params.set("channel_id", scope.channelId);
         if (mId) params.set("max_id", mId);
         return `${base}?${params.toString()}`;
@@ -363,6 +384,70 @@
     const arr = Array.from(map.values());
     arr.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1)); // 按时间正序
     return arr;
+  }
+
+  // 兜底方案：直接翻「频道历史消息」并按作者过滤。
+  // 频道级搜索接口在某些情况下（NSFW/年龄限制频道、线程、搜索索引异常）会返回 403，
+  // 而 /channels/{id}/messages 只要求「读取消息历史」权限，稳定可用。
+  // 游标用 before（= 已抓到的最早一条的 id），复用存档里的 maxId 字段以便断点续传。
+  async function fetchChannelHistoryByAuthor(authorId, scope, resume, key) {
+    const collected = new Map();
+    let before = (resume && resume.maxId) || null;
+    key = key || jobKey(authorId, scope, null);
+
+    if (resume && resume.messages) {
+      for (const m of resume.messages) collected.set(m.id, m);
+    }
+
+    async function saveCheckpoint(done) {
+      try {
+        await idbPut(key, {
+          key, authorId,
+          scope: { type: scope.type, guildId: scope.guildId, channelId: scope.channelId || null },
+          templateUrl: null,
+          maxId: before, total: null,
+          messages: Array.from(collected.values()),
+          updatedAt: Date.now(),
+          done: !!done,
+        });
+      } catch (e) { /* ignore */ }
+    }
+
+    let scanned = 0;
+    let pageCount = 0;
+    while (true) {
+      if (cancelRequested) { await saveCheckpoint(false); throw new Error("__CANCELLED__"); }
+
+      const params = new URLSearchParams();
+      params.set("limit", "100");
+      if (before) params.set("before", before);
+      const batch = await apiGet(`${API}/channels/${scope.channelId}/messages?${params.toString()}`);
+      if (!Array.isArray(batch) || batch.length === 0) break;
+
+      let oldest = null;
+      for (const m of batch) {
+        scanned++;
+        if (m.author && m.author.id === authorId && !collected.has(m.id)) {
+          collected.set(m.id, m);
+        }
+        if (oldest === null || BigInt(m.id) < BigInt(oldest)) oldest = m.id;
+      }
+
+      sendProgress({ stage: "scanning", scanned, collected: collected.size });
+
+      if (oldest === null) break;
+      if (before && oldest === before) break; // 游标没动，防死循环
+      before = oldest;
+
+      // 每 5 页（500 条）存一次档
+      if (++pageCount % 5 === 0) await saveCheckpoint(false);
+
+      if (batch.length < 100) break; // 已到频道最早一条
+      await sleep(650); // 友好限速
+    }
+
+    await saveCheckpoint(true);
+    return finalize(collected);
   }
 
   // -------- 导出格式化 --------
@@ -466,21 +551,31 @@ ${rows}</body></html>`;
 
   // -------- 执行一次导出任务 --------
   async function startExport(opts) {
-    const { mode, query, format, scopeType, textOnly } = opts;
+    const { mode, query, scopeType, textOnly } = opts;
+    // 支持多选导出格式；兼容旧的单个 format 参数
+    const ALLOWED_FORMATS = ["json", "csv", "txt", "html"];
+    let formats = Array.isArray(opts.formats)
+      ? opts.formats.filter((f) => ALLOWED_FORMATS.includes(f))
+      : (opts.format ? [opts.format] : []);
+    if (!formats.length) formats = ["json"];
+    formats = Array.from(new Set(formats));
     if (running) return { ok: false, error: "已有任务在运行中。" };
     if (!TOKEN) return { ok: false, error: "尚未捕获到登录令牌，请在 Discord 里点开任意频道或刷新页面后重试。" };
 
+    // 优先用面板里选中的服务器/频道；没选时退回当前页面所在位置
     const loc = parseLocation();
-    if (!loc.guildId || loc.guildId === "@me") {
-      return { ok: false, error: "请先打开目标服务器的某个频道，再开始导出。" };
+    const guildId = opts.guildId || (loc.guildId && loc.guildId !== "@me" ? loc.guildId : null);
+    const channelId = opts.channelId || loc.channelId || null;
+    if (!guildId) {
+      return { ok: false, error: "请先在面板里选择服务器。" };
     }
-    if (scopeType === "channel" && !loc.channelId) {
-      return { ok: false, error: "未检测到当前频道，请打开一个具体频道。" };
+    if (scopeType === "channel" && !channelId) {
+      return { ok: false, error: "请先选择一个频道，或把搜索范围改成“整个服务器”。" };
     }
 
     const scope = scopeType === "channel"
-      ? { type: "channel", guildId: loc.guildId, channelId: loc.channelId }
-      : { type: "guild", guildId: loc.guildId };
+      ? { type: "channel", guildId, channelId }
+      : { type: "guild", guildId };
 
     running = true;
     cancelRequested = false;
@@ -508,10 +603,19 @@ ${rows}</body></html>`;
           sendProgress({ stage: "resolved", authorId, label: chosen.globalName || chosen.username, count: users.length });
         }
 
-        // 若该 authorId 正好是 Discord 原生搜索刚用过的，复用其完整 URL（参数最可靠）
-        if (lastSearchedAuthor && lastSearchedAuthor.authorId === authorId &&
-            lastSearchedAuthor.searchUrl && scope.type === "guild") {
-          templateUrl = lastSearchedAuthor.searchUrl;
+        // 若该 authorId 正好是 Discord 原生搜索刚用过的，复用其完整 URL（参数最可靠）。
+        // 频道范围时，只有原生搜索确实限定在同一频道才复用。
+        if (lastSearchedAuthor && lastSearchedAuthor.authorId === authorId && lastSearchedAuthor.searchUrl &&
+            (!lastSearchedAuthor.guildId || lastSearchedAuthor.guildId === scope.guildId)) {
+          if (scope.type === "guild") {
+            templateUrl = lastSearchedAuthor.searchUrl;
+          } else if (scope.type === "channel") {
+            try {
+              const u = new URL(lastSearchedAuthor.searchUrl);
+              const cid = u.searchParams.get("channel_id");
+              if (cid === scope.channelId) templateUrl = lastSearchedAuthor.searchUrl;
+            } catch (e) { /* ignore */ }
+          }
         }
 
         // 查找未完成的存档以续传
@@ -526,7 +630,31 @@ ${rows}</body></html>`;
           } catch (e) { /* ignore */ }
         }
 
-        const messages = await fetchAllMessages(authorId, scope, templateUrl, resume);
+        let messages;
+        try {
+          messages = await fetchAllMessages(authorId, scope, templateUrl, resume);
+        } catch (e) {
+          // 频道级搜索接口偶发 400/403/404（NSFW 频道、线程、索引异常等）时，
+          // 改用频道历史消息兜底，只按作者过滤，稳定可用。
+          const canFallback = scope.type === "channel" && e && (
+            e.code === "INDEX_TIMEOUT" ||
+            (e.status && (e.status === 400 || e.status === 403 || e.status === 404 || e.status >= 500))
+          );
+          if (!canFallback) throw e;
+          sendProgress({ stage: "fallback", status: e.status, reason: e.message });
+          // 搜索途中失败时，尽量复用刚存下的断点，避免已抓到的消息白抓
+          let cp2 = resume;
+          try {
+            const cp = await idbGet(jobKey(authorId, scope, templateUrl));
+            if (cp && !cp.done && cp.messages && cp.messages.length &&
+                (!cp2 || cp.messages.length > cp2.messages.length)) {
+              cp2 = cp;
+            }
+          } catch (err) { /* ignore */ }
+          messages = await fetchChannelHistoryByAuthor(
+            authorId, scope, cp2, jobKey(authorId, scope, templateUrl)
+          );
+        }
         const filtered = textOnly
           ? messages.filter((m) => m && typeof m.content === "string" && m.content.trim().length > 0)
           : messages;
@@ -539,17 +667,27 @@ ${rows}</body></html>`;
           channelId: scope.type === "channel" ? scope.channelId : null,
           scope: scope.type,
           usedNativeUrl: !!templateUrl,
+          formats,
           exportedAt: new Date().toISOString(),
         };
-        const out = buildOutput(filtered, format, meta);
-        const filename = `discord_${authorId}_${Date.now()}.${out.ext}`;
+        // 每种选中的格式各生成一个文件，共用一个时间戳
+        const stamp = Date.now();
+        const files = formats.map((fmt) => {
+          const out = buildOutput(filtered, fmt, meta);
+          return {
+            format: fmt,
+            ext: out.ext,
+            mime: out.mime,
+            filename: `discord_${authorId}_${stamp}.${out.ext}`,
+            dataUrl: toDataUrl(out.data, out.mime),
+          };
+        });
         // 导出成功，清掉该任务存档
         try { await idbDel(jobKey(authorId, scope, templateUrl)); } catch (e) { /* ignore */ }
         sendProgress({
           stage: "done",
           collected: filtered.length,
-          dataUrl: toDataUrl(out.data, out.mime),
-          filename,
+          files,
         });
       } catch (e) {
         if (e && e.message === "__CANCELLED__") {
@@ -595,19 +733,32 @@ ${rows}</body></html>`;
         <div class="dme-hint" id="dme-query-hint">先在页面点开该用户资料卡让头像可见，再输入其用户名/昵称。</div>
         <button class="dme-btn dme-secondary dme-mini" id="dme-use-last" type="button">↳ 使用 Discord 搜索框最近的用户</button>
 
+        <div class="dme-field">
+          <label class="dme-label dme-label-row">服务器
+            <button class="dme-link" id="dme-refresh-guilds" type="button" title="重新加载服务器列表">↻ 刷新</button>
+          </label>
+          <select class="dme-input" id="dme-guild"><option value="">加载中…</option></select>
+        </div>
+
+        <div class="dme-field">
+          <label class="dme-label">频道</label>
+          <select class="dme-input" id="dme-channel"><option value="">（不指定 / 整个服务器）</option></select>
+          <div class="dme-hint" id="dme-channel-hint">选中频道会自动切换为「仅所选频道」。</div>
+        </div>
+
         <label class="dme-label">搜索范围</label>
         <div class="dme-radios">
           <label><input type="radio" name="dme-scope" value="guild" checked> 整个服务器</label>
-          <label><input type="radio" name="dme-scope" value="channel"> 仅当前频道</label>
+          <label><input type="radio" name="dme-scope" value="channel"> 仅所选频道</label>
         </div>
 
-        <label class="dme-label">导出格式</label>
-        <select class="dme-input" id="dme-format">
-          <option value="json">JSON</option>
-          <option value="csv">CSV (Excel)</option>
-          <option value="txt">纯文本 TXT</option>
-          <option value="html">HTML 网页</option>
-        </select>
+        <label class="dme-label">导出格式（可多选）</label>
+        <div class="dme-formats">
+          <label class="dme-check"><input type="checkbox" name="dme-format" value="json" checked> JSON</label>
+          <label class="dme-check"><input type="checkbox" name="dme-format" value="csv"> CSV (Excel)</label>
+          <label class="dme-check"><input type="checkbox" name="dme-format" value="txt"> 纯文本 TXT</label>
+          <label class="dme-check"><input type="checkbox" name="dme-format" value="html"> HTML 网页</label>
+        </div>
 
         <label class="dme-check"><input type="checkbox" id="dme-text-only"> 仅保留含文本的消息（过滤纯图片/附件）</label>
 
@@ -635,6 +786,10 @@ ${rows}</body></html>`;
     const progressText = $("dme-progress-text");
     const msgEl = $("dme-msg");
     const bodyEl = $("dme-body");
+    const guildSel = $("dme-guild");
+    const channelSel = $("dme-channel");
+    const channelHint = $("dme-channel-hint");
+    const refreshGuildsBtn = $("dme-refresh-guilds");
 
     function showMsg(text, kind) {
       msgEl.textContent = text;
@@ -649,18 +804,192 @@ ${rows}</body></html>`;
       cancelBtn.disabled = true;
     }
 
-    function refreshStatus() {
+    // ---------- 服务器 / 频道选择 ----------
+    const TEXT_LIKE_TYPES = new Set([0, 2, 5, 13, 15, 16]); // 文字/语音/公告/舞台/论坛/媒体
+    const channelIcon = (t) =>
+      t === 5 ? "📢" : t === 15 ? "🗂" : t === 2 ? "🔊" : t === 13 ? "🎤" : t === 16 ? "🖼" : "#";
+    const channelLabel = (c) => channelIcon(c.type) + " " + c.name + (c.nsfw ? " 🔞" : "");
+
+    function setScope(type) {
+      const r = root.querySelector(`input[name="dme-scope"][value="${type}"]`);
+      if (r) r.checked = true;
+    }
+
+    function updateScopeHint() {
+      const channelRadio = root.querySelector('input[name="dme-scope"][value="channel"]');
+      const hasChannel = !!channelSel.value;
+      channelRadio.disabled = !hasChannel;
+      if (!hasChannel && channelRadio.checked) setScope("guild");
+      channelHint.textContent = hasChannel
+        ? "已选择频道，导出范围将限定在该频道。"
+        : "选中频道会自动切换为「仅所选频道」。";
+    }
+
+    async function fetchGuilds() {
+      const json = await apiGet(`${API}/users/@me/guilds`);
+      const list = (Array.isArray(json) ? json : [])
+        .filter((g) => g && g.id && g.id !== "@me")
+        .map((g) => ({ id: g.id, name: g.name || g.id }));
+      list.sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"));
+      guildsCache = list;
+      return list;
+    }
+
+    async function fetchChannels(guildId, force) {
+      if (!force && channelsCache.has(guildId)) return channelsCache.get(guildId);
+      const json = await apiGet(`${API}/guilds/${guildId}/channels`);
+      const list = (Array.isArray(json) ? json : [])
+        .filter((c) => c && c.id && typeof c.type === "number")
+        .map((c) => ({
+          id: c.id,
+          name: c.name || c.id,
+          type: c.type,
+          parentId: c.parent_id || null,
+          position: typeof c.position === "number" ? c.position : 0,
+          nsfw: !!c.nsfw,
+        }));
+      channelsCache.set(guildId, list);
+      return list;
+    }
+
+    function fillGuildSelect(list, preferredId) {
+      guildSel.innerHTML = "";
+      if (!list.length) {
+        guildSel.appendChild(new Option("（没有可用服务器）", ""));
+        return;
+      }
+      for (const g of list) guildSel.appendChild(new Option(g.name, g.id));
+      if (preferredId && list.some((g) => g.id === preferredId)) guildSel.value = preferredId;
+      else guildSel.value = list[0].id;
+    }
+
+    function fillChannelSelect(guildId, preferredId) {
+      channelSel.innerHTML = "";
+      channelSel.appendChild(new Option("（不指定 / 整个服务器）", ""));
+      const all = channelsCache.get(guildId) || [];
+      const chans = all.filter((c) => TEXT_LIKE_TYPES.has(c.type));
+      const cats = all.filter((c) => c.type === 4).sort((a, b) => a.position - b.position);
+
+      const byParent = new Map();
+      const loose = [];
+      for (const c of chans) {
+        if (c.parentId && cats.some((cat) => cat.id === c.parentId)) {
+          if (!byParent.has(c.parentId)) byParent.set(c.parentId, []);
+          byParent.get(c.parentId).push(c);
+        } else {
+          loose.push(c);
+        }
+      }
+
+      // 无分类频道排在最前（与 Discord 侧栏一致）
+      loose.sort((a, b) => a.position - b.position)
+        .forEach((c) => channelSel.appendChild(new Option(channelLabel(c), c.id)));
+
+      for (const cat of cats) {
+        const children = byParent.get(cat.id);
+        if (!children || !children.length) continue;
+        const grp = document.createElement("optgroup");
+        grp.label = cat.name;
+        children.sort((a, b) => a.position - b.position)
+          .forEach((c) => grp.appendChild(new Option(channelLabel(c), c.id)));
+        channelSel.appendChild(grp);
+      }
+
+      if (preferredId && chans.some((c) => c.id === preferredId)) {
+        channelSel.value = preferredId;
+      } else if (preferredId) {
+        // 当前页面是线程/论坛帖子等不在服务器频道列表里的频道时，仍允许选中它
+        channelSel.appendChild(new Option("当前页面频道（" + preferredId + "）", preferredId));
+        channelSel.value = preferredId;
+      } else if (!chans.length) {
+        channelSel.appendChild(new Option("（没有可用频道）", ""));
+        channelSel.value = "";
+      } else {
+        channelSel.value = "";
+      }
+    }
+
+    async function onGuildChange(preferredChannelId, force) {
+      const gid = guildSel.value;
+      channelSel.innerHTML = "";
+      channelSel.appendChild(new Option("加载中…", ""));
+      if (!gid) { updateScopeHint(); return; }
+      try {
+        await fetchChannels(gid, force);
+        if (guildSel.value !== gid) return; // 期间又切换了服务器，丢弃旧结果
+        fillChannelSelect(gid, preferredChannelId || null);
+      } catch (e) {
+        if (guildSel.value !== gid) return;
+        channelSel.innerHTML = "";
+        channelSel.appendChild(new Option("（频道加载失败，点「刷新」重试）", ""));
+        showMsg("加载频道列表失败：" + ((e && e.message) || "未知错误"), "error");
+      }
+      updateScopeHint();
+    }
+
+    async function loadGuildsAndChannels(force) {
       const loc = parseLocation();
+      const onPageGuild = loc.guildId && loc.guildId !== "@me" ? loc.guildId : null;
+      const prevGuild = guildSel.value;
+      const prevChannel = channelSel.value;
+      guildSel.innerHTML = "";
+      guildSel.appendChild(new Option("加载中…", ""));
+      channelSel.innerHTML = "";
+      channelSel.appendChild(new Option("加载中…", ""));
+      try {
+        if (force) { guildsCache = null; channelsCache.clear(); }
+        const list = guildsCache || await fetchGuilds();
+        // 当前页面所在服务器若不在列表里（例如刚加入），补一个占位项
+        if (onPageGuild && !list.some((g) => g.id === onPageGuild)) {
+          list.unshift({ id: onPageGuild, name: "当前服务器（" + onPageGuild + "）" });
+        }
+        // 刷新时优先保留原来的选择；否则定位到当前页面所在服务器/频道
+        const targetGuild =
+          (prevGuild && list.some((g) => g.id === prevGuild)) ? prevGuild : onPageGuild;
+        fillGuildSelect(list, targetGuild);
+        const preferredChannel =
+          targetGuild === prevGuild ? prevChannel
+            : (targetGuild === onPageGuild ? loc.channelId : null);
+        await onGuildChange(preferredChannel || null, force);
+      } catch (e) {
+        guildSel.innerHTML = "";
+        guildSel.appendChild(new Option("（加载失败，点「刷新」重试）", ""));
+        channelSel.innerHTML = "";
+        channelSel.appendChild(new Option("（不指定 / 整个服务器）", ""));
+        updateScopeHint();
+        showMsg("加载服务器列表失败：" + ((e && e.message) || "未知错误"), "error");
+      }
+    }
+
+    guildSel.addEventListener("change", () => {
+      const loc = parseLocation();
+      const preferred = loc.guildId === guildSel.value ? loc.channelId : null;
+      onGuildChange(preferred, false);
+    });
+    channelSel.addEventListener("change", () => {
+      setScope(channelSel.value ? "channel" : "guild");
+      updateScopeHint();
+    });
+    refreshGuildsBtn.addEventListener("click", () => {
+      if (running) return;
+      loadGuildsAndChannels(true);
+    });
+
+    function refreshStatus() {
       if (!TOKEN) {
         setStatus("未捕获令牌，请点开任意频道或刷新", "warn");
-      } else if (!loc.guildId || loc.guildId === "@me") {
-        setStatus("请打开目标服务器的频道", "warn");
+      } else if (!guildSel.value) {
+        setStatus("请选择服务器", "warn");
       } else {
         setStatus("已就绪", "ok");
       }
     }
     refreshStatus();
     const statusTimer = setInterval(refreshStatus, 1500);
+    loadGuildsAndChannels(false);
+    onTokenReady = () => {
+      if (!guildsCache) loadGuildsAndChannels(false);
+    };
 
     // 进度回调，更新本悬浮窗
     onProgress = function (msg) {
@@ -702,17 +1031,38 @@ ${rows}</body></html>`;
         case "ratelimited":
           progressText.textContent = `触发限速，等待 ${Math.ceil((msg.waitMs || 1000) / 1000)} 秒…`;
           break;
-        case "done":
+        case "fallback":
+          progressEl.classList.remove("dme-hidden");
+          progressText.textContent = "频道搜索接口不可用，正在改用频道历史扫描…";
+          showMsg("频道级搜索不可用（" + (msg.status ? "HTTP " + msg.status : "搜索索引未就绪") + "），已自动切换为逐个翻频道历史并按作者过滤，速度会慢一些。", "info");
+          break;
+        case "scanning":
+          progressEl.classList.remove("dme-hidden");
+          progressText.textContent = `正在扫描频道历史：已检查 ${msg.scanned} 条，命中 ${msg.collected} 条…`;
+          break;
+        case "done": {
           barFill.style.width = "100%";
           progressText.textContent = `完成，共 ${msg.collected} 条`;
+          const files = (Array.isArray(msg.files) && msg.files.length)
+            ? msg.files
+            : (msg.dataUrl ? [{ dataUrl: msg.dataUrl, filename: msg.filename, format: "" }] : []);
           if (msg.collected === 0) {
             showMsg("搜索结果为 0 条。可能原因：用户 ID 不对、该用户在此范围内没有发言、或你无权查看相关频道。", "error");
           } else {
-            showMsg(`导出完成，共 ${msg.collected} 条，文件已开始下载。`, "success");
+            const names = files.map((f) => (f.format || f.ext || "").toUpperCase()).filter(Boolean).join("、");
+            const extra = files.length > 1
+              ? "若浏览器询问是否允许下载多个文件，请点「允许」。"
+              : "";
+            showMsg(`导出完成，共 ${msg.collected} 条，正在下载 ${files.length} 个文件` +
+              (names ? `（${names}）` : "") + `。${extra}`, "success");
           }
-          if (msg.dataUrl) triggerDownload(msg.dataUrl, msg.filename);
+          // 依次触发下载，间隔一点时间，避免被浏览器拦截
+          files.forEach((f, i) => {
+            setTimeout(() => triggerDownload(f.dataUrl, f.filename), i * 400);
+          });
           resetButtons();
           break;
+        }
         case "cancelled":
           progressText.textContent = "已取消";
           showMsg("任务已取消。", "info");
@@ -773,9 +1123,24 @@ ${rows}</body></html>`;
         showMsg("用户 ID 应为一串纯数字。", "error");
         return;
       }
-      const format = $("dme-format").value;
+      const formats = Array.from(root.querySelectorAll('input[name="dme-format"]:checked'))
+        .map((el) => el.value);
+      if (!formats.length) {
+        showMsg("请至少选择一种导出格式。", "error");
+        return;
+      }
       const scopeType = root.querySelector('input[name="dme-scope"]:checked').value;
       const textOnly = $("dme-text-only").checked;
+      const guildId = guildSel.value || null;
+      const channelId = channelSel.value || null;
+      if (!guildId) {
+        showMsg("请先在「服务器」里选择一个服务器。", "error");
+        return;
+      }
+      if (scopeType === "channel" && !channelId) {
+        showMsg("「仅所选频道」需要先在「频道」里选一个频道。", "error");
+        return;
+      }
 
       startBtn.disabled = true;
       cancelBtn.disabled = false;
@@ -784,7 +1149,7 @@ ${rows}</body></html>`;
       progressText.textContent = "开始中…";
       showMsg("正在抓取，请保持此 Discord 标签页打开。", "info");
 
-      const resp = await startExport({ mode, query, format, scopeType, textOnly });
+      const resp = await startExport({ mode, query, formats, scopeType, textOnly, guildId, channelId });
       if (!resp.ok) {
         showMsg(resp.error, "error");
         resetButtons();
@@ -803,6 +1168,7 @@ ${rows}</body></html>`;
     });
     $("dme-close").addEventListener("click", () => {
       clearInterval(statusTimer);
+      onTokenReady = null;
       root.remove();
       panel = null;
     });
@@ -858,7 +1224,7 @@ ${rows}</body></html>`;
     const s = document.createElement("style");
     s.id = "dme-style";
     s.textContent = `
-#dme-panel{position:fixed;top:70px;right:20px;width:300px;z-index:2147483647;
+#dme-panel{position:fixed;top:70px;right:20px;width:420px;max-width:calc(100vw - 24px);z-index:2147483647;
   background:#2b2d31;color:#dbdee1;border:1px solid #1e1f22;border-radius:8px;
   box-shadow:0 8px 24px rgba(0,0,0,.5);font-family:system-ui,"Segoe UI",sans-serif;font-size:13px;}
 #dme-panel *{box-sizing:border-box;}
@@ -869,20 +1235,28 @@ ${rows}</body></html>`;
 .dme-icon{width:22px;height:22px;border:none;border-radius:4px;background:transparent;color:#b5bac1;
   cursor:pointer;font-size:14px;line-height:1;}
 .dme-icon:hover{background:#35373c;color:#fff;}
-.dme-body{padding:12px;}
+.dme-body{padding:12px 14px 14px;max-height:calc(100vh - 150px);overflow-y:auto;}
 .dme-status{font-size:11px;padding:3px 8px;border-radius:10px;background:#1e1f22;color:#949ba4;
   display:inline-block;margin-bottom:10px;}
 .dme-status.dme-ok{color:#23a55a;} .dme-status.dme-warn{color:#f0b232;} .dme-status.dme-err{color:#f23f43;}
 .dme-label{display:block;font-size:12px;font-weight:600;margin:8px 0 4px;color:#b5bac1;}
+.dme-label-row{display:flex;align-items:center;justify-content:space-between;}
+.dme-link{background:none;border:none;padding:0;color:#00a8fc;font-size:11px;font-weight:500;cursor:pointer;}
+.dme-link:hover{text-decoration:underline;}
+.dme-field{margin-top:2px;}
 .dme-input{width:100%;padding:7px;border-radius:4px;border:1px solid #1e1f22;background:#1e1f22;
   color:#dbdee1;font-size:13px;}
 .dme-input:focus{outline:none;border-color:#5865f2;}
+select.dme-input{cursor:pointer;}
+select.dme-input option, select.dme-input optgroup{background:#1e1f22;color:#dbdee1;}
 .dme-hint{font-size:11px;color:#80848e;margin-top:3px;}
 .dme-radios{display:flex;gap:12px;}
 .dme-radios label{display:flex;align-items:center;gap:4px;cursor:pointer;}
 .dme-radios input{accent-color:#5865f2;}
 .dme-check{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:12px;font-weight:400;color:#b5bac1;cursor:pointer;}
 .dme-check input{accent-color:#5865f2;}
+.dme-formats{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:2px;}
+.dme-formats .dme-check{margin-top:2px;}
 .dme-actions{display:flex;gap:8px;margin-top:12px;}
 .dme-btn{flex:1;padding:8px;border:none;border-radius:4px;font-size:13px;font-weight:600;cursor:pointer;}
 .dme-btn:disabled{opacity:.5;cursor:not-allowed;}
