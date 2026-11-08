@@ -14,6 +14,7 @@
   let guildsCache = null;               // [{id, name, icon}]
   const channelsCache = new Map();      // guildId -> [{id, name, type, parent_id, position, nsfw}]
   let onTokenReady = null;              // 令牌晚到时用来触发面板重新加载列表
+  let liveState = null;                 // 当前任务状态：用于「下载当前进度」
 
   // 接收主世界传来的 token
   window.addEventListener("message", function (ev) {
@@ -292,6 +293,7 @@
     let maxId = null;            // 游标：只取比它更早的消息
     let totalEstimate = null;
     const key = jobKey(authorId, scope, templateUrl);
+    if (liveState) liveState.collected = collected; // 让 UI 随时能读到当前进度
 
     // 恢复存档
     if (resume && resume.messages) {
@@ -394,6 +396,7 @@
     const collected = new Map();
     let before = (resume && resume.maxId) || null;
     key = key || jobKey(authorId, scope, null);
+    if (liveState) liveState.collected = collected;
 
     if (resume && resume.messages) {
       for (const m of resume.messages) collected.set(m.id, m);
@@ -531,6 +534,55 @@ ${rows}</body></html>`;
     return `data:${mime};base64,` + btoa(bin);
   }
 
+  // 按需过滤「仅含文本」
+  function filterTextOnly(messages, textOnly) {
+    return textOnly
+      ? messages.filter((m) => m && typeof m.content === "string" && m.content.trim().length > 0)
+      : messages;
+  }
+
+  // 按选中的格式生成待下载文件列表（每种格式一个）
+  function buildExportFiles(messages, formats, meta, suffix) {
+    const stamp = Date.now();
+    return formats.map((fmt) => {
+      const out = buildOutput(messages, fmt, meta);
+      return {
+        format: fmt,
+        ext: out.ext,
+        mime: out.mime,
+        filename: `discord_${meta.authorId}_${stamp}${suffix || ""}.${out.ext}`,
+        dataUrl: toDataUrl(out.data, out.mime),
+      };
+    });
+  }
+
+  // 导出「当前已抓到的部分」，用于中途取消/暂停时先拿走已有结果
+  function exportPartial() {
+    if (!liveState || !liveState.collected || liveState.collected.size === 0) {
+      return { ok: false, error: "还没有抓到任何消息，暂时没有可导出的内容。" };
+    }
+    const messages = filterTextOnly(finalize(liveState.collected), liveState.textOnly);
+    const scope = liveState.scope;
+    const meta = {
+      authorId: liveState.authorId,
+      query: liveState.query,
+      mode: liveState.mode,
+      textOnly: liveState.textOnly,
+      guildId: scope.guildId,
+      channelId: scope.type === "channel" ? scope.channelId : null,
+      scope: scope.type,
+      usedNativeUrl: !!liveState.templateUrl,
+      formats: liveState.formats,
+      partial: true,
+      exportedAt: new Date().toISOString(),
+    };
+    return {
+      ok: true,
+      count: messages.length,
+      files: buildExportFiles(messages, liveState.formats, meta, "_partial"),
+    };
+  }
+
   // -------- 解析当前页面所在的 guild/channel --------
   function parseLocation() {
     // URL 形如 /channels/{guildId}/{channelId}
@@ -579,6 +631,17 @@ ${rows}</body></html>`;
 
     running = true;
     cancelRequested = false;
+    liveState = {
+      authorId: query, // 名称模式下解析完成后会更新为真实 ID
+      query,
+      mode,
+      textOnly: !!textOnly,
+      formats,
+      scope,
+      templateUrl: null,
+      collected: null,
+      startedAt: Date.now(),
+    };
 
     (async () => {
       try {
@@ -603,6 +666,8 @@ ${rows}</body></html>`;
           sendProgress({ stage: "resolved", authorId, label: chosen.globalName || chosen.username, count: users.length });
         }
 
+        if (liveState) liveState.authorId = authorId;
+
         // 若该 authorId 正好是 Discord 原生搜索刚用过的，复用其完整 URL（参数最可靠）。
         // 频道范围时，只有原生搜索确实限定在同一频道才复用。
         if (lastSearchedAuthor && lastSearchedAuthor.authorId === authorId && lastSearchedAuthor.searchUrl &&
@@ -617,6 +682,8 @@ ${rows}</body></html>`;
             } catch (e) { /* ignore */ }
           }
         }
+
+        if (liveState) liveState.templateUrl = templateUrl;
 
         // 查找未完成的存档以续传
         let resume = null;
@@ -655,9 +722,7 @@ ${rows}</body></html>`;
             authorId, scope, cp2, jobKey(authorId, scope, templateUrl)
           );
         }
-        const filtered = textOnly
-          ? messages.filter((m) => m && typeof m.content === "string" && m.content.trim().length > 0)
-          : messages;
+        const filtered = filterTextOnly(messages, textOnly);
         const meta = {
           authorId,
           query,
@@ -670,20 +735,10 @@ ${rows}</body></html>`;
           formats,
           exportedAt: new Date().toISOString(),
         };
-        // 每种选中的格式各生成一个文件，共用一个时间戳
-        const stamp = Date.now();
-        const files = formats.map((fmt) => {
-          const out = buildOutput(filtered, fmt, meta);
-          return {
-            format: fmt,
-            ext: out.ext,
-            mime: out.mime,
-            filename: `discord_${authorId}_${stamp}.${out.ext}`,
-            dataUrl: toDataUrl(out.data, out.mime),
-          };
-        });
+        const files = buildExportFiles(filtered, formats, meta, "");
         // 导出成功，清掉该任务存档
         try { await idbDel(jobKey(authorId, scope, templateUrl)); } catch (e) { /* ignore */ }
+        liveState = null; // 已完整导出，不再需要「下载当前进度」
         sendProgress({
           stage: "done",
           collected: filtered.length,
@@ -770,6 +825,7 @@ ${rows}</body></html>`;
         <div class="dme-progress dme-hidden" id="dme-progress">
           <div class="dme-bar"><div class="dme-bar-fill" id="dme-bar-fill"></div></div>
           <div class="dme-progress-text" id="dme-progress-text"></div>
+          <button class="dme-btn dme-secondary dme-mini dme-hidden" id="dme-download-partial" type="button">下载当前进度</button>
         </div>
         <div class="dme-msg dme-hidden" id="dme-msg"></div>
       </div>
@@ -790,6 +846,7 @@ ${rows}</body></html>`;
     const channelSel = $("dme-channel");
     const channelHint = $("dme-channel-hint");
     const refreshGuildsBtn = $("dme-refresh-guilds");
+    const partialBtn = $("dme-download-partial");
 
     function showMsg(text, kind) {
       msgEl.textContent = text;
@@ -802,6 +859,19 @@ ${rows}</body></html>`;
     function resetButtons() {
       startBtn.disabled = false;
       cancelBtn.disabled = true;
+    }
+
+    // 「下载当前进度」按钮：只要有已抓到的消息就显示
+    function updatePartialBtn() {
+      const n = (liveState && liveState.collected) ? liveState.collected.size : 0;
+      if (n > 0) {
+        partialBtn.classList.remove("dme-hidden");
+        partialBtn.disabled = false;
+        partialBtn.textContent = `⬇ 下载当前进度（${n} 条）`;
+      } else {
+        partialBtn.classList.add("dme-hidden");
+        partialBtn.disabled = true;
+      }
     }
 
     // ---------- 服务器 / 频道选择 ----------
@@ -986,6 +1056,7 @@ ${rows}</body></html>`;
     }
     refreshStatus();
     const statusTimer = setInterval(refreshStatus, 1500);
+    updatePartialBtn(); // 面板重新打开时恢复「下载当前进度」
     loadGuildsAndChannels(false);
     onTokenReady = () => {
       if (!guildsCache) loadGuildsAndChannels(false);
@@ -1008,6 +1079,7 @@ ${rows}</body></html>`;
           progressEl.classList.remove("dme-hidden");
           progressText.textContent = `从上次断点继续，已有 ${msg.collected} 条`;
           showMsg(`检测到未完成的存档，正在断点续传（已抓 ${msg.collected} 条）。`, "info");
+          updatePartialBtn();
           break;
         case "neterror":
           progressText.textContent = `网络中断，${Math.ceil((msg.waitMs || 1000) / 1000)} 秒后重试（第 ${msg.attempt} 次）…进度已存档`;
@@ -1022,6 +1094,7 @@ ${rows}</body></html>`;
           } else {
             progressText.textContent = `已抓取 ${c} 条…`;
           }
+          updatePartialBtn();
           break;
         }
         case "indexing":
@@ -1039,6 +1112,7 @@ ${rows}</body></html>`;
         case "scanning":
           progressEl.classList.remove("dme-hidden");
           progressText.textContent = `正在扫描频道历史：已检查 ${msg.scanned} 条，命中 ${msg.collected} 条…`;
+          updatePartialBtn();
           break;
         case "done": {
           barFill.style.width = "100%";
@@ -1060,19 +1134,29 @@ ${rows}</body></html>`;
           files.forEach((f, i) => {
             setTimeout(() => triggerDownload(f.dataUrl, f.filename), i * 400);
           });
+          updatePartialBtn();
           resetButtons();
           break;
         }
-        case "cancelled":
+        case "cancelled": {
           progressText.textContent = "已取消";
-          showMsg("任务已取消。", "info");
+          const n = (liveState && liveState.collected) ? liveState.collected.size : 0;
+          showMsg(n > 0
+            ? `任务已取消。已抓到的 ${n} 条可以点下方「下载当前进度」保存。`
+            : "任务已取消。", "info");
+          updatePartialBtn();
           resetButtons();
           break;
-        case "error":
+        }
+        case "error": {
           progressText.textContent = "出错";
-          showMsg("出错：" + (msg.error || "未知错误"), "error");
+          const n = (liveState && liveState.collected) ? liveState.collected.size : 0;
+          showMsg("出错：" + (msg.error || "未知错误") +
+            (n > 0 ? `（已抓到的 ${n} 条仍可点下方「下载当前进度」保存）` : ""), "error");
+          updatePartialBtn();
           resetButtons();
           break;
+        }
       }
     };
 
@@ -1153,6 +1237,8 @@ ${rows}</body></html>`;
       if (!resp.ok) {
         showMsg(resp.error, "error");
         resetButtons();
+      } else {
+        updatePartialBtn(); // 新任务开始，先隐藏旧进度按钮
       }
     });
 
@@ -1160,6 +1246,20 @@ ${rows}</body></html>`;
       cancelRequested = true;
       cancelBtn.disabled = true;
       progressText.textContent = "正在取消…";
+    });
+
+    // 中途（或取消后）把已抓到的部分先导出
+    partialBtn.addEventListener("click", () => {
+      const res = exportPartial();
+      if (!res.ok) {
+        showMsg(res.error, "error");
+        return;
+      }
+      res.files.forEach((f, i) => {
+        setTimeout(() => triggerDownload(f.dataUrl, f.filename), i * 400);
+      });
+      const names = res.files.map((f) => f.format.toUpperCase()).join("、");
+      showMsg(`已导出当前进度：${res.count} 条，正在下载 ${res.files.length} 个文件（${names}），文件名带 _partial。`, "success");
     });
 
     // 最小化 / 关闭
