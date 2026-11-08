@@ -556,30 +556,40 @@ ${rows}</body></html>`;
     });
   }
 
-  // 导出「当前已抓到的部分」，用于中途取消/暂停时先拿走已有结果
-  function exportPartial() {
+  // 导出「当前已抓到的部分」，用于中途取消/暂停时先拿走已有结果。
+  // opts.formats / opts.textOnly 由面板传入「当前界面上的选择」，这样任务开始后
+  // 再改格式/勾选项，点「下载当前进度」也按新选择导出。
+  function exportPartial(opts) {
     if (!liveState || !liveState.collected || liveState.collected.size === 0) {
       return { ok: false, error: "还没有抓到任何消息，暂时没有可导出的内容。" };
     }
-    const messages = filterTextOnly(finalize(liveState.collected), liveState.textOnly);
+    const ALLOWED_FORMATS = ["json", "csv", "txt", "html"];
+    let formats = (opts && Array.isArray(opts.formats))
+      ? opts.formats.filter((f) => ALLOWED_FORMATS.includes(f))
+      : [];
+    if (!formats.length) formats = (liveState.formats || []).filter((f) => ALLOWED_FORMATS.includes(f));
+    if (!formats.length) formats = ["json"];
+    const textOnly = (opts && typeof opts.textOnly === "boolean") ? opts.textOnly : liveState.textOnly;
+
+    const messages = filterTextOnly(finalize(liveState.collected), textOnly);
     const scope = liveState.scope;
     const meta = {
       authorId: liveState.authorId,
       query: liveState.query,
       mode: liveState.mode,
-      textOnly: liveState.textOnly,
+      textOnly: textOnly,
       guildId: scope.guildId,
       channelId: scope.type === "channel" ? scope.channelId : null,
       scope: scope.type,
       usedNativeUrl: !!liveState.templateUrl,
-      formats: liveState.formats,
+      formats: formats,
       partial: true,
       exportedAt: new Date().toISOString(),
     };
     return {
       ok: true,
       count: messages.length,
-      files: buildExportFiles(messages, liveState.formats, meta, "_partial"),
+      files: buildExportFiles(messages, formats, meta, "_partial"),
     };
   }
 
@@ -1248,9 +1258,15 @@ ${rows}</body></html>`;
       progressText.textContent = "正在取消…";
     });
 
-    // 中途（或取消后）把已抓到的部分先导出
+    // 中途（或取消后）把已抓到的部分先导出（按面板上「当前」的格式/勾选）
     partialBtn.addEventListener("click", () => {
-      const res = exportPartial();
+      const formats = Array.from(root.querySelectorAll('input[name="dme-format"]:checked'))
+        .map((el) => el.value);
+      if (!formats.length) {
+        showMsg("请至少勾选一种导出格式。", "error");
+        return;
+      }
+      const res = exportPartial({ formats, textOnly: $("dme-text-only").checked });
       if (!res.ok) {
         showMsg(res.error, "error");
         return;
