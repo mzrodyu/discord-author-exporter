@@ -100,9 +100,10 @@
     }));
   }
 
-  // 任务唯一键：作者 + 范围 + 模板URL，参数一致才算同一个任务
-  function jobKey(authorId, scope, templateUrl) {
-    return [authorId, scope.type, scope.guildId, scope.channelId || "", templateUrl ? "tpl" : "std"].join("|");
+  // 任务唯一键：作者 + 范围。不再把「是否复用原生 URL」算进去，
+  // 这样同一作者/范围每次导出都能对上同一个存档，方便断点续传与增量更新。
+  function jobKey(authorId, scope) {
+    return [authorId, scope.type, scope.guildId, scope.channelId || ""].join("|");
   }
 
   // 进度通过 UI 回调直接更新页面悬浮窗（UI 在文件后半部分定义并赋值给 onProgress）
@@ -288,19 +289,35 @@
   // 核心：抓取某服务器中指定用户的全部消息
   // 用 snowflake 游标(max_id)翻页，避开 offset 5000 上限，也不会因稀疏页提前结束。
   // 支持断点续传：每抓若干页就把游标+消息存进 IndexedDB。
+  // 支持增量更新：若上次已完整导出，这次只用 min_id 抓更新的消息，并合并旧记录。
   async function fetchAllMessages(authorId, scope, templateUrl, resume) {
     const collected = new Map(); // id -> message，去重
-    let maxId = null;            // 游标：只取比它更早的消息
+    let maxId = null;            // 游标：只取比它更早的消息（首次 / 未完成续传）
+    let minId = null;            // 增量：只取比它更新的消息
+    let newestId = null;         // 已收集消息里最新的 id
+    let incremental = false;
     let totalEstimate = null;
-    const key = jobKey(authorId, scope, templateUrl);
+    const key = jobKey(authorId, scope);
     if (liveState) liveState.collected = collected; // 让 UI 随时能读到当前进度
 
-    // 恢复存档
-    if (resume && resume.messages) {
-      for (const m of resume.messages) collected.set(m.id, m);
-      maxId = resume.maxId || null;
-      totalEstimate = resume.total || null;
+    // 恢复存档：未完成的往下续抓；已完成的做增量（旧消息保留，只补新消息）
+    if (resume && resume.messages && resume.messages.length) {
+      for (const m of resume.messages) {
+        collected.set(m.id, m);
+        if (newestId === null || BigInt(m.id) > BigInt(newestId)) newestId = m.id;
+      }
+      if (resume.done) {
+        incremental = true;
+        minId = resume.newestId || newestId;
+        newestId = minId; // 保留上次的扫描游标，避免下次重复扫描
+      } else {
+        maxId = resume.maxId || null;
+        totalEstimate = resume.total || null;
+      }
     }
+    const seedCount = collected.size;
+    if (liveState) { liveState.incremental = incremental; liveState.seedCount = seedCount; }
+    if (incremental) sendProgress({ stage: "incremental", seed: seedCount });
 
     async function saveCheckpoint(done) {
       try {
@@ -308,7 +325,8 @@
           key, authorId,
           scope: { type: scope.type, guildId: scope.guildId, channelId: scope.channelId || null },
           templateUrl: templateUrl || null,
-          maxId, total: totalEstimate,
+          maxId, minId, newestId, incremental,
+          total: totalEstimate,
           messages: Array.from(collected.values()),
           updatedAt: Date.now(),
           done: !!done,
@@ -326,6 +344,8 @@
         u.searchParams.set("include_nsfw", "true");
         if (mId) u.searchParams.set("max_id", mId);
         else u.searchParams.delete("max_id");
+        if (minId) u.searchParams.set("min_id", minId);
+        else u.searchParams.delete("min_id");
         return u.href;
       };
     } else {
@@ -340,6 +360,7 @@
         params.set("include_nsfw", "true");
         if (scope.type === "channel") params.set("channel_id", scope.channelId);
         if (mId) params.set("max_id", mId);
+        if (minId) params.set("min_id", minId);
         return `${base}?${params.toString()}`;
       };
     }
@@ -360,11 +381,14 @@
       let smallest = null;
       let added = 0;
       for (const m of hits) {
-        if (!collected.has(m.id)) { collected.set(m.id, m); added++; }
+        if (!collected.has(m.id)) {
+          collected.set(m.id, m); added++;
+          if (newestId === null || BigInt(m.id) > BigInt(newestId)) newestId = m.id;
+        }
         if (smallest === null || BigInt(m.id) < BigInt(smallest)) smallest = m.id;
       }
 
-      sendProgress({ stage: "fetching", collected: collected.size, total: totalEstimate });
+      sendProgress({ stage: "fetching", collected: collected.size, total: totalEstimate, seed: seedCount, incremental });
 
       if (added === 0) break;
 
@@ -391,16 +415,32 @@
   // 兜底方案：直接翻「频道历史消息」并按作者过滤。
   // 频道级搜索接口在某些情况下（NSFW/年龄限制频道、线程、搜索索引异常）会返回 403，
   // 而 /channels/{id}/messages 只要求「读取消息历史」权限，稳定可用。
-  // 游标用 before（= 已抓到的最早一条的 id），复用存档里的 maxId 字段以便断点续传。
+  // 未完成时用 before 往前续抓；上次已完成时用 after 只补新消息。
   async function fetchChannelHistoryByAuthor(authorId, scope, resume, key) {
     const collected = new Map();
-    let before = (resume && resume.maxId) || null;
-    key = key || jobKey(authorId, scope, null);
+    let before = null;      // 非增量：往前翻的游标
+    let after = null;       // 增量：只取更新的消息
+    let newestId = null;    // 已扫描到的最新 id（用于下次增量）
+    let incremental = false;
+    key = key || jobKey(authorId, scope);
     if (liveState) liveState.collected = collected;
 
-    if (resume && resume.messages) {
-      for (const m of resume.messages) collected.set(m.id, m);
+    if (resume && resume.messages && resume.messages.length) {
+      for (const m of resume.messages) {
+        collected.set(m.id, m);
+        if (newestId === null || BigInt(m.id) > BigInt(newestId)) newestId = m.id;
+      }
+      if (resume.done) {
+        incremental = true;
+        after = resume.newestId || newestId;
+        newestId = after;
+      } else {
+        before = resume.maxId || null;
+      }
     }
+    const seedCount = collected.size;
+    if (liveState) { liveState.incremental = incremental; liveState.seedCount = seedCount; }
+    if (incremental) sendProgress({ stage: "incremental", seed: seedCount });
 
     async function saveCheckpoint(done) {
       try {
@@ -408,7 +448,7 @@
           key, authorId,
           scope: { type: scope.type, guildId: scope.guildId, channelId: scope.channelId || null },
           templateUrl: null,
-          maxId: before, total: null,
+          maxId: before, newestId, incremental, total: null,
           messages: Array.from(collected.values()),
           updatedAt: Date.now(),
           done: !!done,
@@ -423,29 +463,39 @@
 
       const params = new URLSearchParams();
       params.set("limit", "100");
-      if (before) params.set("before", before);
+      if (incremental) { if (after) params.set("after", after); }
+      else if (before) params.set("before", before);
       const batch = await apiGet(`${API}/channels/${scope.channelId}/messages?${params.toString()}`);
       if (!Array.isArray(batch) || batch.length === 0) break;
 
       let oldest = null;
+      let newest = null;
       for (const m of batch) {
         scanned++;
         if (m.author && m.author.id === authorId && !collected.has(m.id)) {
           collected.set(m.id, m);
         }
         if (oldest === null || BigInt(m.id) < BigInt(oldest)) oldest = m.id;
+        if (newest === null || BigInt(m.id) > BigInt(newest)) newest = m.id;
       }
+      if (newest !== null && (newestId === null || BigInt(newest) > BigInt(newestId))) newestId = newest;
 
-      sendProgress({ stage: "scanning", scanned, collected: collected.size });
+      sendProgress({ stage: "scanning", scanned, collected: collected.size, seed: seedCount, incremental });
 
-      if (oldest === null) break;
-      if (before && oldest === before) break; // 游标没动，防死循环
-      before = oldest;
+      if (incremental) {
+        if (newest === null) break;
+        if (after && newest === after) break; // 游标没动，防死循环
+        after = newest;
+      } else {
+        if (oldest === null) break;
+        if (before && oldest === before) break;
+        before = oldest;
+      }
 
       // 每 5 页（500 条）存一次档
       if (++pageCount % 5 === 0) await saveCheckpoint(false);
 
-      if (batch.length < 100) break; // 已到频道最早一条
+      if (batch.length < 100) break; // 没有更多了
       await sleep(650); // 友好限速
     }
 
@@ -695,14 +745,15 @@ ${rows}</body></html>`;
 
         if (liveState) liveState.templateUrl = templateUrl;
 
-        // 查找未完成的存档以续传
+        // 查找存档：未完成的续传；已完成的做增量（除非取消勾选「从上次继续」）
+        const wantIncremental = opts.incremental !== false;
         let resume = null;
-        if (!opts.fresh) {
+        if (wantIncremental) {
           try {
-            const cp = await idbGet(jobKey(authorId, scope, templateUrl));
-            if (cp && !cp.done && cp.messages && cp.messages.length) {
+            const cp = await idbGet(jobKey(authorId, scope));
+            if (cp && cp.messages && cp.messages.length) {
               resume = cp;
-              sendProgress({ stage: "resumed", collected: cp.messages.length });
+              if (!cp.done) sendProgress({ stage: "resumed", collected: cp.messages.length });
             }
           } catch (e) { /* ignore */ }
         }
@@ -722,17 +773,21 @@ ${rows}</body></html>`;
           // 搜索途中失败时，尽量复用刚存下的断点，避免已抓到的消息白抓
           let cp2 = resume;
           try {
-            const cp = await idbGet(jobKey(authorId, scope, templateUrl));
+            const cp = await idbGet(jobKey(authorId, scope));
             if (cp && !cp.done && cp.messages && cp.messages.length &&
                 (!cp2 || cp.messages.length > cp2.messages.length)) {
               cp2 = cp;
             }
           } catch (err) { /* ignore */ }
           messages = await fetchChannelHistoryByAuthor(
-            authorId, scope, cp2, jobKey(authorId, scope, templateUrl)
+            authorId, scope, cp2, jobKey(authorId, scope)
           );
         }
         const filtered = filterTextOnly(messages, textOnly);
+        // 本次是否为「从上次导出继续」的增量任务
+        const wasIncremental = !!(liveState && liveState.incremental);
+        const seedCount = (liveState && liveState.seedCount) || 0;
+        const newCount = wasIncremental ? Math.max(0, messages.length - seedCount) : messages.length;
         const meta = {
           authorId,
           query,
@@ -743,15 +798,18 @@ ${rows}</body></html>`;
           scope: scope.type,
           usedNativeUrl: !!templateUrl,
           formats,
+          incremental: wasIncremental,
+          newCount,
           exportedAt: new Date().toISOString(),
         };
         const files = buildExportFiles(filtered, formats, meta, "");
-        // 导出成功，清掉该任务存档
-        try { await idbDel(jobKey(authorId, scope, templateUrl)); } catch (e) { /* ignore */ }
+        // 保留已完成的存档，供下次「从上次导出继续」只抓新消息
         liveState = null; // 已完整导出，不再需要「下载当前进度」
         sendProgress({
           stage: "done",
           collected: filtered.length,
+          newCount,
+          incremental: wasIncremental,
           files,
         });
       } catch (e) {
@@ -825,6 +883,7 @@ ${rows}</body></html>`;
           <label class="dme-check"><input type="checkbox" name="dme-format" value="html"> HTML 网页</label>
         </div>
 
+        <label class="dme-check"><input type="checkbox" id="dme-incremental" checked> 从上次导出继续（只抓新消息，合并旧记录）</label>
         <label class="dme-check"><input type="checkbox" id="dme-text-only"> 仅保留含文本的消息（过滤纯图片/附件）</label>
 
         <div class="dme-actions">
@@ -1091,13 +1150,27 @@ ${rows}</body></html>`;
           showMsg(`检测到未完成的存档，正在断点续传（已抓 ${msg.collected} 条）。`, "info");
           updatePartialBtn();
           break;
+        case "incremental":
+          progressEl.classList.remove("dme-hidden");
+          progressText.textContent = `从上次导出继续：已有 ${msg.seed} 条，正在抓取新消息…`;
+          showMsg(`检测到上次导出的 ${msg.seed} 条记录，本次只抓取之后的新消息，最终会合并导出。`, "info");
+          updatePartialBtn();
+          break;
         case "neterror":
           progressText.textContent = `网络中断，${Math.ceil((msg.waitMs || 1000) / 1000)} 秒后重试（第 ${msg.attempt} 次）…进度已存档`;
           break;
         case "fetching": {
           const c = msg.collected || 0;
+          const seed = msg.seed || 0;
           progressEl.classList.remove("dme-hidden");
-          if (msg.total) {
+          if (msg.incremental) {
+            const added = Math.max(0, c - seed);
+            if (msg.total) {
+              const pct = Math.min(99, Math.round((added / msg.total) * 100));
+              barFill.style.width = pct + "%";
+            }
+            progressText.textContent = `已有 ${seed} 条，本次新增 ${added} 条…`;
+          } else if (msg.total) {
             const pct = Math.min(99, Math.round((c / msg.total) * 100));
             barFill.style.width = pct + "%";
             progressText.textContent = `已抓取 ${c} / 约 ${msg.total} 条`;
@@ -1119,14 +1192,23 @@ ${rows}</body></html>`;
           progressText.textContent = "频道搜索接口不可用，正在改用频道历史扫描…";
           showMsg("频道级搜索不可用（" + (msg.status ? "HTTP " + msg.status : "搜索索引未就绪") + "），已自动切换为逐个翻频道历史并按作者过滤，速度会慢一些。", "info");
           break;
-        case "scanning":
+        case "scanning": {
           progressEl.classList.remove("dme-hidden");
-          progressText.textContent = `正在扫描频道历史：已检查 ${msg.scanned} 条，命中 ${msg.collected} 条…`;
+          const seed = msg.seed || 0;
+          if (msg.incremental) {
+            progressText.textContent = `已有 ${seed} 条，本次新增 ${Math.max(0, (msg.collected || 0) - seed)} 条（已扫描 ${msg.scanned} 条）…`;
+          } else {
+            progressText.textContent = `正在扫描频道历史：已检查 ${msg.scanned} 条，命中 ${msg.collected} 条…`;
+          }
           updatePartialBtn();
           break;
+        }
         case "done": {
           barFill.style.width = "100%";
-          progressText.textContent = `完成，共 ${msg.collected} 条`;
+          const isInc = msg.incremental && typeof msg.newCount === "number";
+          progressText.textContent = isInc
+            ? `完成，共 ${msg.collected} 条（本次新增 ${msg.newCount}）`
+            : `完成，共 ${msg.collected} 条`;
           const files = (Array.isArray(msg.files) && msg.files.length)
             ? msg.files
             : (msg.dataUrl ? [{ dataUrl: msg.dataUrl, filename: msg.filename, format: "" }] : []);
@@ -1137,7 +1219,10 @@ ${rows}</body></html>`;
             const extra = files.length > 1
               ? "若浏览器询问是否允许下载多个文件，请点「允许」。"
               : "";
-            showMsg(`导出完成，共 ${msg.collected} 条，正在下载 ${files.length} 个文件` +
+            const summary = isInc
+              ? `本次新增 ${msg.newCount} 条，累计 ${msg.collected} 条，`
+              : `共 ${msg.collected} 条，`;
+            showMsg(`导出完成，${summary}正在下载 ${files.length} 个文件` +
               (names ? `（${names}）` : "") + `。${extra}`, "success");
           }
           // 依次触发下载，间隔一点时间，避免被浏览器拦截
@@ -1225,6 +1310,7 @@ ${rows}</body></html>`;
       }
       const scopeType = root.querySelector('input[name="dme-scope"]:checked').value;
       const textOnly = $("dme-text-only").checked;
+      const incremental = $("dme-incremental").checked;
       const guildId = guildSel.value || null;
       const channelId = channelSel.value || null;
       if (!guildId) {
@@ -1243,7 +1329,7 @@ ${rows}</body></html>`;
       progressText.textContent = "开始中…";
       showMsg("正在抓取，请保持此 Discord 标签页打开。", "info");
 
-      const resp = await startExport({ mode, query, formats, scopeType, textOnly, guildId, channelId });
+      const resp = await startExport({ mode, query, formats, scopeType, textOnly, incremental, guildId, channelId });
       if (!resp.ok) {
         showMsg(resp.error, "error");
         resetButtons();
