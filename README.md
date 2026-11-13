@@ -52,11 +52,11 @@ GET /api/v9/guilds/{guildId}/messages/search?author_id={userId}
    - **By username**: first open that user's profile card or view one of their messages on the page so the extension can capture their info, then type the username.
    - **By user ID**: enable Developer Mode in Discord settings, right-click the user's avatar → "Copy User ID", and paste it in — the most reliable option.
    - Or: search `from: someone` once in **Discord's own search bar** first, then click "Use the user from Discord's last search" in the panel to reuse that exact, already-validated search request.
-4. Pick the **server** and **channel** in the panel (it defaults to the server/channel you're currently viewing; leave the channel empty to target the whole server), then choose the search scope (whole server / selected channel only) and export format. Optionally check "text-only messages" to filter out attachment-only messages.
+4. Pick the **server** and **channel** in the panel (it defaults to the server/channel you're currently viewing; leave the channel empty to target the whole server), then choose the search scope (whole server / selected channel only) and export format. Optionally check "text-only messages" to filter out attachment-only messages. Set an optional **Start date** to export only messages **at or after 00:00 on that date in your local timezone**; leave it empty for no date limit. Both search and channel-history fallback respect this date.
 5. Click "Start Export" and wait. The file downloads automatically when done. You can cancel at any time; **while running or after cancelling, click "Download current progress" to export what has been collected so far** (it uses the formats/text-only options currently selected in the panel; filenames include `_partial`).
-6. "Continue from last export" (checked by default) remembers the previous result per **user + server/channel**: the next run only fetches messages newer than the last export and merges them with the old records into one complete file (progress shows "N new"). Uncheck it to force a full re-fetch from scratch.
+6. "Continue from last export" (checked by default) remembers the previous result per **user + server/channel + start date**: the next run only fetches messages newer than the last export and merges them with the old records within that date range (progress shows "N new"). Different start dates have separate checkpoints, so older records won't be merged back in. Uncheck it to re-fetch the selected date range from scratch.
 
-If your connection drops or the page closes mid-export, progress isn't lost — clicking "Start Export" again with the same user/scope will automatically resume from the last checkpoint.
+If your connection drops or the page closes mid-export, progress isn't lost — clicking "Start Export" again with the same user, scope, and start date will automatically resume from the last checkpoint.
 
 ## Export formats
 

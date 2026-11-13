@@ -100,10 +100,33 @@
     }));
   }
 
-  // 任务唯一键：作者 + 范围。不再把「是否复用原生 URL」算进去，
-  // 这样同一作者/范围每次导出都能对上同一个存档，方便断点续传与增量更新。
+  // 起始日期按本地时区的当天 00:00 计算；min_id 为排他边界，减 1 以包含零点消息。
+  function dateToMinId(startDate) {
+    if (!startDate) return null;
+    const date = new Date(`${startDate}T00:00:00`);
+    const [year, month, day] = String(startDate).split("-").map(Number);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !Number.isFinite(date.getTime()) ||
+        date.getFullYear() !== year || date.getMonth() + 1 !== month || date.getDate() !== day) {
+      throw new Error("请选择有效的起始日期（年-月-日）。");
+    }
+    const elapsed = BigInt(date.getTime()) - 1420070400000n; // Discord snowflake 纪元
+    return elapsed > 0n ? ((elapsed << 22n) - 1n).toString() : "0";
+  }
+
+  function isAfterId(id, minId) {
+    return minId === null || BigInt(id) > BigInt(minId);
+  }
+
+  function laterId(a, b) {
+    if (a === null) return b;
+    if (b === null) return a;
+    return BigInt(a) > BigInt(b) ? a : b;
+  }
+
+  // 不填日期时保留旧键；不同日期范围独立存档，避免合并旧消息或漏抓更早的范围。
   function jobKey(authorId, scope) {
-    return [authorId, scope.type, scope.guildId, scope.channelId || ""].join("|");
+    const key = [authorId, scope.type, scope.guildId, scope.channelId || ""].join("|");
+    return scope.startDate ? `${key}|from:${dateToMinId(scope.startDate)}` : key;
   }
 
   // 进度通过 UI 回调直接更新页面悬浮窗（UI 在文件后半部分定义并赋值给 onProgress）
@@ -293,7 +316,8 @@
   async function fetchAllMessages(authorId, scope, templateUrl, resume) {
     const collected = new Map(); // id -> message，去重
     let maxId = null;            // 游标：只取比它更早的消息（首次 / 未完成续传）
-    let minId = null;            // 增量：只取比它更新的消息
+    const dateMinId = dateToMinId(scope.startDate);
+    let minId = dateMinId;       // 起始日期 / 增量的排他下界
     let newestId = null;         // 已收集消息里最新的 id
     let incremental = false;
     let totalEstimate = null;
@@ -301,17 +325,20 @@
     if (liveState) liveState.collected = collected; // 让 UI 随时能读到当前进度
 
     // 恢复存档：未完成的往下续抓；已完成的做增量（旧消息保留，只补新消息）
-    if (resume && resume.messages && resume.messages.length) {
+    if (resume && Array.isArray(resume.messages)) {
       for (const m of resume.messages) {
+        if (!isAfterId(m.id, dateMinId)) continue;
         collected.set(m.id, m);
-        if (newestId === null || BigInt(m.id) > BigInt(newestId)) newestId = m.id;
+        newestId = laterId(newestId, m.id);
       }
       if (resume.done) {
         incremental = true;
-        minId = resume.newestId || newestId;
-        newestId = minId; // 保留上次的扫描游标，避免下次重复扫描
+        minId = laterId(dateMinId, resume.newestId || newestId);
+        newestId = resume.newestId || newestId; // 保留上次的扫描游标
       } else {
         maxId = resume.maxId || null;
+        minId = laterId(dateMinId, resume.minId || null);
+        incremental = !!resume.incremental;
         totalEstimate = resume.total || null;
       }
     }
@@ -323,7 +350,7 @@
       try {
         await idbPut(key, {
           key, authorId,
-          scope: { type: scope.type, guildId: scope.guildId, channelId: scope.channelId || null },
+          scope: { type: scope.type, guildId: scope.guildId, channelId: scope.channelId || null, startDate: scope.startDate || null },
           templateUrl: templateUrl || null,
           maxId, minId, newestId, incremental,
           total: totalEstimate,
@@ -341,6 +368,8 @@
       makeUrl = (mId) => {
         const u = new URL(tpl.href);
         u.searchParams.set("offset", "0");
+        u.searchParams.set("sort_by", "timestamp");
+        u.searchParams.set("sort_order", "desc");
         u.searchParams.set("include_nsfw", "true");
         if (mId) u.searchParams.set("max_id", mId);
         else u.searchParams.delete("max_id");
@@ -368,6 +397,7 @@
     let pageCount = 0;
     while (true) {
       if (cancelRequested) { await saveCheckpoint(false); throw new Error("__CANCELLED__"); }
+      if (maxId && minId && BigInt(maxId) <= BigInt(minId)) break;
 
       const json = await apiGet(makeUrl(maxId));
       if (totalEstimate === null && typeof json.total_results === "number") {
@@ -381,7 +411,7 @@
       let smallest = null;
       let added = 0;
       for (const m of hits) {
-        if (!collected.has(m.id)) {
+        if (isAfterId(m.id, minId) && !collected.has(m.id)) {
           collected.set(m.id, m); added++;
           if (newestId === null || BigInt(m.id) > BigInt(newestId)) newestId = m.id;
         }
@@ -390,7 +420,7 @@
 
       sendProgress({ stage: "fetching", collected: collected.size, total: totalEstimate, seed: seedCount, incremental });
 
-      if (added === 0) break;
+      if (added === 0 || !isAfterId(smallest, minId)) break;
 
       const next = (BigInt(smallest) - 1n).toString();
       if (maxId && next === maxId) break; // 游标没动，防止死循环
@@ -422,18 +452,24 @@
     let after = null;       // 增量：只取更新的消息
     let newestId = null;    // 已扫描到的最新 id（用于下次增量）
     let incremental = false;
+    const dateMinId = dateToMinId(scope.startDate);
     key = key || jobKey(authorId, scope);
     if (liveState) liveState.collected = collected;
 
-    if (resume && resume.messages && resume.messages.length) {
+    if (resume && Array.isArray(resume.messages)) {
       for (const m of resume.messages) {
+        if (!isAfterId(m.id, dateMinId)) continue;
         collected.set(m.id, m);
-        if (newestId === null || BigInt(m.id) > BigInt(newestId)) newestId = m.id;
+        newestId = laterId(newestId, m.id);
       }
       if (resume.done) {
+        after = laterId(dateMinId, resume.newestId || newestId);
+        incremental = after !== null;
+        newestId = resume.newestId || newestId;
+      } else if (resume.incremental && resume.minId) {
         incremental = true;
-        after = resume.newestId || newestId;
-        newestId = after;
+        after = laterId(dateMinId, resume.minId);
+        newestId = resume.newestId || newestId;
       } else {
         before = resume.maxId || null;
       }
@@ -446,9 +482,9 @@
       try {
         await idbPut(key, {
           key, authorId,
-          scope: { type: scope.type, guildId: scope.guildId, channelId: scope.channelId || null },
+          scope: { type: scope.type, guildId: scope.guildId, channelId: scope.channelId || null, startDate: scope.startDate || null },
           templateUrl: null,
-          maxId: before, newestId, incremental, total: null,
+          maxId: before, minId: after, newestId, incremental, total: null,
           messages: Array.from(collected.values()),
           updatedAt: Date.now(),
           done: !!done,
@@ -460,6 +496,7 @@
     let pageCount = 0;
     while (true) {
       if (cancelRequested) { await saveCheckpoint(false); throw new Error("__CANCELLED__"); }
+      if (!incremental && before && dateMinId && BigInt(before) <= BigInt(dateMinId)) break;
 
       const params = new URLSearchParams();
       params.set("limit", "100");
@@ -472,7 +509,7 @@
       let newest = null;
       for (const m of batch) {
         scanned++;
-        if (m.author && m.author.id === authorId && !collected.has(m.id)) {
+        if (isAfterId(m.id, dateMinId) && m.author && m.author.id === authorId && !collected.has(m.id)) {
           collected.set(m.id, m);
         }
         if (oldest === null || BigInt(m.id) < BigInt(oldest)) oldest = m.id;
@@ -490,6 +527,7 @@
         if (oldest === null) break;
         if (before && oldest === before) break;
         before = oldest;
+        if (!isAfterId(oldest, dateMinId)) break; // 跨过起始日期，无需继续扫描旧消息
       }
 
       // 每 5 页（500 条）存一次档
@@ -631,6 +669,7 @@ ${rows}</body></html>`;
       guildId: scope.guildId,
       channelId: scope.type === "channel" ? scope.channelId : null,
       scope: scope.type,
+      startDate: scope.startDate || null,
       usedNativeUrl: !!liveState.templateUrl,
       formats: formats,
       partial: true,
@@ -674,6 +713,13 @@ ${rows}</body></html>`;
     if (running) return { ok: false, error: "已有任务在运行中。" };
     if (!TOKEN) return { ok: false, error: "尚未捕获到登录令牌，请在 Discord 里点开任意频道或刷新页面后重试。" };
 
+    const startDate = opts.startDate || null;
+    try {
+      dateToMinId(startDate);
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+
     // 优先用面板里选中的服务器/频道；没选时退回当前页面所在位置
     const loc = parseLocation();
     const guildId = opts.guildId || (loc.guildId && loc.guildId !== "@me" ? loc.guildId : null);
@@ -686,8 +732,8 @@ ${rows}</body></html>`;
     }
 
     const scope = scopeType === "channel"
-      ? { type: "channel", guildId, channelId }
-      : { type: "guild", guildId };
+      ? { type: "channel", guildId, channelId, startDate }
+      : { type: "guild", guildId, startDate };
 
     running = true;
     cancelRequested = false;
@@ -751,7 +797,7 @@ ${rows}</body></html>`;
         if (wantIncremental) {
           try {
             const cp = await idbGet(jobKey(authorId, scope));
-            if (cp && cp.messages && cp.messages.length) {
+            if (cp && Array.isArray(cp.messages)) {
               resume = cp;
               if (!cp.done) sendProgress({ stage: "resumed", collected: cp.messages.length });
             }
@@ -796,6 +842,7 @@ ${rows}</body></html>`;
           guildId: scope.guildId,
           channelId: scope.type === "channel" ? scope.channelId : null,
           scope: scope.type,
+          startDate,
           usedNativeUrl: !!templateUrl,
           formats,
           incremental: wasIncremental,
@@ -874,6 +921,10 @@ ${rows}</body></html>`;
           <label><input type="radio" name="dme-scope" value="guild" checked> 整个服务器</label>
           <label><input type="radio" name="dme-scope" value="channel"> 仅所选频道</label>
         </div>
+
+        <label class="dme-label" for="dme-start-date">起始日期（可选）</label>
+        <input class="dme-input" id="dme-start-date" type="date" />
+        <div class="dme-hint">只导出所选日期当天 00:00 及之后的消息（本地时区）；留空不限制。不同起始日期独立存档，不会合并日期之前的记录。</div>
 
         <label class="dme-label">导出格式（可多选）</label>
         <div class="dme-formats">
@@ -1311,6 +1362,12 @@ ${rows}</body></html>`;
       const scopeType = root.querySelector('input[name="dme-scope"]:checked').value;
       const textOnly = $("dme-text-only").checked;
       const incremental = $("dme-incremental").checked;
+      const startDateInput = $("dme-start-date");
+      if (!startDateInput.checkValidity()) {
+        showMsg("请选择有效的起始日期。", "error");
+        return;
+      }
+      const startDate = startDateInput.value || null;
       const guildId = guildSel.value || null;
       const channelId = channelSel.value || null;
       if (!guildId) {
@@ -1329,7 +1386,7 @@ ${rows}</body></html>`;
       progressText.textContent = "开始中…";
       showMsg("正在抓取，请保持此 Discord 标签页打开。", "info");
 
-      const resp = await startExport({ mode, query, formats, scopeType, textOnly, incremental, guildId, channelId });
+      const resp = await startExport({ mode, query, formats, scopeType, textOnly, incremental, startDate, guildId, channelId });
       if (!resp.ok) {
         showMsg(resp.error, "error");
         resetButtons();
@@ -1449,6 +1506,7 @@ ${rows}</body></html>`;
 .dme-input{width:100%;padding:7px;border-radius:4px;border:1px solid #1e1f22;background:#1e1f22;
   color:#dbdee1;font-size:13px;}
 .dme-input:focus{outline:none;border-color:#5865f2;}
+input.dme-input[type="date"]{color-scheme:dark;}
 select.dme-input{cursor:pointer;}
 select.dme-input option, select.dme-input optgroup{background:#1e1f22;color:#dbdee1;}
 .dme-hint{font-size:11px;color:#80848e;margin-top:3px;}
